@@ -4,6 +4,8 @@ Layer-wise decoder distillation for Hugging Face decoder-only language models. I
 
 Distillation works by capturing the teacher’s decoder-input latent at a chosen layer, running both teacher and student decoders on that same latent, and updating only the student decoder to match the teacher output while the rest of the model stays aligned to the teacher; this repeats layer-by-layer for a fixed number of steps with optional validation, and checkpoints keep the teacher backbone but replace all decoders with the distilled student versions.
 
+This project is conceptually related to RADLADS (Rapid Attention Distillation to Linear Attention Decoders at Scale), which motivates the follow-on full-model logits distillation phase implemented here.
+
 ## Quickstart (AMD/ROCm)
 
 1. Create a venv and install minimal ROCm PyTorch deps:
@@ -96,3 +98,7 @@ Sequences may cross document boundaries.
 
 - This repo ignores `models/` and `data/` in git; they are expected to be large.
 - AMD/ROCm compatibility is a soft requirement; prefer portable defaults. Per-arch flags are intended for rare cases.
+
+## Reference
+
+- Daniel Goldstein, Eric Alcaide, Janna Lu, Eugene Cheah. “RADLADS: Rapid Attention Distillation to Linear Attention Decoders at Scale.” COLM 2025. arXiv:2505.03005v4.
