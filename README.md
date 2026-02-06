@@ -37,8 +37,10 @@ torchrun --standalone --nproc_per_node 1 train.py
 
 4. Distill (layer-wise rotation schedule):
 
+Edit the single command line in `distill.sh`, then run:
+
 ```bash
-torchrun --standalone --nproc_per_node 1 distill.py --out-dir runs
+./distill.sh
 ```
 
 ## Scripts

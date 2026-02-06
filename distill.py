@@ -43,6 +43,8 @@ from __future__ import annotations
 import argparse
 import glob
 import os
+import re
+import inspect
 import time
 import uuid
 from dataclasses import dataclass, asdict
@@ -133,7 +135,7 @@ COMPILE_WITH_DDP = False
 DECODER_LOSS = "mse"  # currently only "mse"
 
 # Optimizer
-LR = 3e-4
+LR = 0.01
 WEIGHT_DECAY = 0.0
 BETAS = (0.9, 0.95)
 TRY_FUSED_ADAMW = True
@@ -142,20 +144,25 @@ TRY_FUSED_ADAMW = True
 VAL_TOKENS = 1048576
 VAL_EVERY_LAYER = True
 LOG_EVERY = 10  # steps (within the per-layer inner loop)
+SAVE_EVERY = 100  # global steps; set <=0 to disable periodic student_XXXX.pt saves
+LATENT_CACHE_DEVICE = "cpu"  # store cached layer outputs on this device
 
 
 # -----------------------------------------------------------------------------
 # DDP helpers (optional; single-process works without torchrun)
 
-def _ddp_setup() -> tuple[int, int, int, torch.device]:
-    # If torchrun is used, these will exist. Otherwise default to single process.
-    rank = int(os.environ.get("RANK", "0"))
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+def _ddp_setup(
+    rank: int,
+    local_rank: int,
+    world_size: int,
+    master_addr: str,
+    master_port: int,
+) -> tuple[int, int, int, torch.device]:
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
     if world_size > 1 and not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
+        init_method = f"tcp://{master_addr}:{master_port}"
+        dist.init_process_group(backend="nccl", init_method=init_method, rank=rank, world_size=world_size)
         torch.cuda.set_device(device)
 
     return rank, local_rank, world_size, device
@@ -417,6 +424,9 @@ def swap_hf_decoders(hf_model: nn.Module, *, decoder_kind: str, decoder_kwargs: 
                 old_inter = infer_decoder_intermediate_dim(_old)
                 new_kwargs["hidden_dim"] = round_down_8(int(old_inter * float(scale)))
         new = build_decoder(decoder_kind, int(hidden_size), new_kwargs)
+        old_param = next(_old.parameters(), None)
+        if old_param is not None:
+            new = new.to(device=old_param.device, dtype=old_param.dtype)
         setattr(layer, attr, HFDecoderAdapter(new))
 
 
@@ -503,10 +513,113 @@ def capture_decoder_input(hf_model: nn.Module, decoder: nn.Module, input_ids: to
     return captured["x"]
 
 
+@torch.no_grad()
+def build_initial_hidden_states(
+    hf_model: nn.Module, input_ids: torch.Tensor, position_ids: torch.Tensor
+) -> torch.Tensor:
+    if hasattr(hf_model, "model") and hasattr(hf_model.model, "embed_tokens"):
+        return hf_model.model.embed_tokens(input_ids)
+    if hasattr(hf_model, "transformer") and hasattr(hf_model.transformer, "wte"):
+        hidden = hf_model.transformer.wte(input_ids)
+        if hasattr(hf_model.transformer, "wpe"):
+            hidden = hidden + hf_model.transformer.wpe(position_ids)
+        if hasattr(hf_model.transformer, "drop"):
+            hidden = hf_model.transformer.drop(hidden)
+        return hidden
+    if hasattr(hf_model, "gpt_neox") and hasattr(hf_model.gpt_neox, "embed_in"):
+        hidden = hf_model.gpt_neox.embed_in(input_ids)
+        if hasattr(hf_model.gpt_neox, "emb_dropout"):
+            hidden = hf_model.gpt_neox.emb_dropout(hidden)
+        return hidden
+    return hf_model.get_input_embeddings()(input_ids)
+
+
+def run_teacher_layer(
+    layer: nn.Module,
+    decoder: nn.Module,
+    hidden_states: torch.Tensor,
+    position_ids: torch.Tensor,
+    layer_sig_params: set[str],
+    rotary_emb: nn.Module | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    captured_in: dict[str, torch.Tensor] = {}
+    captured_out: dict[str, torch.Tensor] = {}
+
+    def _pre_hook(_module: nn.Module, inputs: tuple[torch.Tensor, ...]) -> None:
+        if "x" not in captured_in:
+            captured_in["x"] = inputs[0].detach()
+
+    def _post_hook(_module: nn.Module, _inputs: tuple[torch.Tensor, ...], outputs) -> None:
+        if "y" not in captured_out:
+            out = outputs[0] if isinstance(outputs, tuple) else outputs
+            captured_out["y"] = out.detach()
+
+    h1 = decoder.register_forward_pre_hook(_pre_hook)
+    h2 = decoder.register_forward_hook(_post_hook)
+    try:
+        kwargs = {}
+        if "attention_mask" in layer_sig_params:
+            kwargs["attention_mask"] = None
+        if "position_ids" in layer_sig_params:
+            kwargs["position_ids"] = position_ids
+        if "position_embeddings" in layer_sig_params and rotary_emb is not None:
+            kwargs["position_embeddings"] = rotary_emb(hidden_states, position_ids)
+        if "cache_position" in layer_sig_params:
+            kwargs["cache_position"] = position_ids[0]
+        if "use_cache" in layer_sig_params:
+            kwargs["use_cache"] = False
+        out = layer(hidden_states, **kwargs)
+    finally:
+        h1.remove()
+        h2.remove()
+
+    if isinstance(out, tuple):
+        out = out[0]
+    if "x" not in captured_in or "y" not in captured_out:
+        raise RuntimeError("Failed to capture decoder input/output for layer forward.")
+    return captured_in["x"], captured_out["y"], out
+
+
+def build_hidden_cache(
+    train_loader: "DistributedDataLoader",
+    hf_model: nn.Module,
+    total_micro_steps: int,
+    batch_size: int,
+    seq_len: int,
+    device: torch.device,
+    cache_device: torch.device,
+) -> tuple[list[torch.Tensor], torch.Tensor]:
+    train_loader.reset()
+    pos_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+    cache: list[torch.Tensor] = []
+    for _ in range(total_micro_steps):
+        x, _ = train_loader.next_batch(device)
+        hidden = build_initial_hidden_states(hf_model, x, pos_ids)
+        cache.append(hidden.detach().to(cache_device))
+    return cache, pos_ids
+
+
 def decoder_loss(student_out: torch.Tensor, teacher_out: torch.Tensor) -> torch.Tensor:
     if DECODER_LOSS == "mse":
         return F.mse_loss(student_out.float(), teacher_out.float())
     raise ValueError(f"Unknown DECODER_LOSS: {DECODER_LOSS}")
+
+
+@dataclass
+class CachedCheckpoint:
+    name: str
+    kind: str
+    payload: dict
+
+
+def move_to_cpu(obj):
+    if torch.is_tensor(obj):
+        return obj.detach().cpu()
+    if isinstance(obj, dict):
+        return {k: move_to_cpu(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(move_to_cpu(v) for v in obj)
+    return obj
 
 
 def load_state_dict_strict(model: nn.Module, state_dict: dict) -> None:
@@ -530,23 +643,123 @@ def load_state_dict_strict(model: nn.Module, state_dict: dict) -> None:
         raise RuntimeError("Checkpoint/model mismatch (" + ", ".join(msg) + ")")
 
 
+def _student_ckpt_name(step: int) -> str:
+    return f"student_{int(step):06d}.pt"
+
+
+def _find_latest_student_ckpt(run_dir: str) -> tuple[str | None, int | None]:
+    pattern = re.compile(r"^student_(\d+)\.pt$")
+    best_step = None
+    best_path = None
+    if not os.path.isdir(run_dir):
+        return None, None
+    for name in os.listdir(run_dir):
+        m = pattern.match(name)
+        if not m:
+            continue
+        step = int(m.group(1))
+        if best_step is None or step > best_step:
+            best_step = step
+            best_path = os.path.join(run_dir, name)
+    return best_path, best_step
+
+
+def _resolve_run_dir(out_dir: str, run_dir: str | None, new_run: bool) -> tuple[str, str]:
+    if run_dir:
+        return run_dir, os.path.basename(os.path.normpath(run_dir))
+    os.makedirs(out_dir, exist_ok=True)
+    if not new_run:
+        candidates = []
+        for name in os.listdir(out_dir):
+            path = os.path.join(out_dir, name)
+            if os.path.isdir(path):
+                candidates.append(path)
+        if candidates:
+            latest = max(candidates, key=lambda p: os.path.getmtime(p))
+            return latest, os.path.basename(latest)
+    run_id = str(uuid.uuid4())
+    return os.path.join(out_dir, run_id), run_id
+
+
+def _cache_checkpoint(
+    memory_cache: list[CachedCheckpoint],
+    name: str,
+    kind: str,
+    ckpt: dict,
+) -> None:
+    memory_cache.append(CachedCheckpoint(name=name, kind=kind, payload=move_to_cpu(ckpt)))
+    print(f"[ckpt] cached in memory: {name} ({kind})")
+
+
+def _evict_kinds(memory_cache: list[CachedCheckpoint], kinds: set[str]) -> None:
+    if not memory_cache:
+        return
+    memory_cache[:] = [entry for entry in memory_cache if entry.kind not in kinds]
+
+
+def _consolidate_to_intermediate(
+    memory_cache: list[CachedCheckpoint],
+    ckpt: dict,
+    name: str,
+) -> None:
+    # Keep only a single intermediate checkpoint in memory.
+    _evict_kinds(memory_cache, {"step", "layer", "intermediate"})
+    _cache_checkpoint(memory_cache, name, "intermediate", ckpt)
+
+
+def _evict_intermediate(memory_cache: list[CachedCheckpoint]) -> None:
+    _evict_kinds(memory_cache, {"intermediate"})
+
+
+def _save_checkpoint(
+    ckpt: dict,
+    name: str,
+    out_dir: str,
+    memory_cache: list[CachedCheckpoint],
+    use_memory_cache: bool,
+    force_disk: bool = False,
+    kind: str = "generic",
+) -> None:
+    if (not force_disk) and use_memory_cache:
+        _cache_checkpoint(memory_cache, name, kind, ckpt)
+        return
+    torch.save(ckpt, os.path.join(out_dir, name))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out-dir", type=str, default="runs", help="Output directory for logs/checkpoints.")
     parser.add_argument("--steps-per-layer", type=int, default=STEPS_PER_LAYER, help="Steps per layer per rotation.")
+    parser.add_argument("--batch-size", type=int, default=DEVICE_BATCH_SIZE, help="Per-device batch size.")
+    parser.add_argument("--seq-len", type=int, default=SEQ_LEN, help="Sequence length.")
+    parser.add_argument("--save-every", type=int, default=SAVE_EVERY, help="Save student checkpoint every N steps.")
+    parser.add_argument("--run-dir", type=str, default=None, help="Run directory to resume/save into.")
+    parser.add_argument("--new-run", action="store_true", help="Force a new run directory under --out-dir.")
     parser.add_argument("--no-compile", action="store_true", help="Disable torch.compile.")
+    parser.add_argument("--memory-cache", action="store_true", help="Keep checkpoints in memory instead of writing to disk.")
+    parser.add_argument("--rank", type=int, default=0, help="Process rank (for multi-process runs).")
+    parser.add_argument("--local-rank", "--local_rank", dest="local_rank", type=int, default=0, help="Local rank.")
+    parser.add_argument("--world-size", type=int, default=1, help="World size (number of processes).")
+    parser.add_argument("--master-addr", type=str, default="127.0.0.1", help="Master address for DDP.")
+    parser.add_argument("--master-port", type=int, default=29500, help="Master port for DDP.")
     args = parser.parse_args()
 
     torch.manual_seed(SEED)
     np.random.seed(SEED)
 
-    rank, local_rank, world_size, device = _ddp_setup()
+    rank, local_rank, world_size, device = _ddp_setup(
+        args.rank,
+        args.local_rank,
+        args.world_size,
+        args.master_addr,
+        args.master_port,
+    )
     master = _is_master(rank)
 
-    run_id = str(uuid.uuid4())
-    out_dir = os.path.join(args.out_dir, run_id)
+    out_dir, run_id = _resolve_run_dir(args.out_dir, args.run_dir, args.new_run)
     if master:
         os.makedirs(out_dir, exist_ok=True)
+    memory_cache: list[CachedCheckpoint] = []
 
     hf_path = _hf_load_path()
     if master:
@@ -580,17 +793,22 @@ def main() -> None:
         student = DDP(student, device_ids=[local_rank], find_unused_parameters=True)
 
     if (not args.no_compile) and USE_COMPILE:
-        if dist.is_initialized() and not COMPILE_WITH_DDP:
+        # torch.compile is brittle with the decoder-only runner (dynamic layer selection).
+        # Skip by default to avoid fake-tensor device errors.
+        if isinstance(student, StudentDecoderRunner):
+            if master:
+                print("[compile] Skipping torch.compile for decoder-only runner.")
+        elif dist.is_initialized() and not COMPILE_WITH_DDP:
             if master:
                 print("[compile] DDP detected; skipping torch.compile (COMPILE_WITH_DDP=False).")
         else:
             student = torch.compile(student)
 
-    train_loader = DistributedDataLoader(TRAIN_GLOB, DEVICE_BATCH_SIZE, SEQ_LEN, rank, world_size)
-    val_loader = DistributedDataLoader(VAL_GLOB, DEVICE_BATCH_SIZE, SEQ_LEN, rank, world_size)
+    train_loader = DistributedDataLoader(TRAIN_GLOB, args.batch_size, args.seq_len, rank, world_size)
+    val_loader = DistributedDataLoader(VAL_GLOB, args.batch_size, args.seq_len, rank, world_size)
 
     # Validation steps must divide evenly.
-    tokens_per_val_step = DEVICE_BATCH_SIZE * SEQ_LEN * world_size
+    tokens_per_val_step = args.batch_size * args.seq_len * world_size
     if VAL_TOKENS % tokens_per_val_step != 0:
         raise RuntimeError(
             f"VAL_TOKENS ({VAL_TOKENS}) must be divisible by B*T*world_size ({tokens_per_val_step})."
@@ -610,10 +828,28 @@ def main() -> None:
 
     opt = _make_optimizer()
 
-    tokens_per_step = DEVICE_BATCH_SIZE * SEQ_LEN * world_size * GRAD_ACCUM_STEPS
+    tokens_per_step = args.batch_size * args.seq_len * world_size * GRAD_ACCUM_STEPS
     teacher_layers = resolve_hf_layers(teacher)
+    teacher_decoders = [resolve_hf_decoder_submodule(layer)[1] for layer in teacher_layers]
+    layer_sig_params = [set(inspect.signature(layer.forward).parameters.keys()) for layer in teacher_layers]
+    rotary_emb = getattr(getattr(teacher, "model", None), "rotary_emb", None)
     num_layers = len(teacher_layers)
     total_steps = num_layers * int(args.steps_per_layer) * ROTATIONS
+
+    steps_per_layer = int(args.steps_per_layer)
+    total_micro_steps = steps_per_layer * GRAD_ACCUM_STEPS
+    cache_device = torch.device(LATENT_CACHE_DEVICE)
+
+    resume_path, resume_step = _find_latest_student_ckpt(out_dir)
+    global_step = 0
+    if resume_path:
+        ckpt = torch.load(resume_path, map_location="cpu")
+        load_state_dict_strict(student_raw, ckpt.get("student", {}))
+        if "optimizer" in ckpt:
+            opt.load_state_dict(ckpt["optimizer"])
+        global_step = int(ckpt.get("global_step", resume_step or 0))
+        if master:
+            print(f"[resume] {resume_path} (global_step={global_step})")
 
     if master:
         meta = dict(
@@ -629,8 +865,8 @@ def main() -> None:
             },
             train_glob=TRAIN_GLOB,
             val_glob=VAL_GLOB,
-            device_batch_size=DEVICE_BATCH_SIZE,
-            seq_len=SEQ_LEN,
+            device_batch_size=int(args.batch_size),
+            seq_len=int(args.seq_len),
             grad_accum_steps=GRAD_ACCUM_STEPS,
             rotations=ROTATIONS,
             steps_per_layer=int(args.steps_per_layer),
@@ -642,6 +878,8 @@ def main() -> None:
             lr=LR,
             weight_decay=WEIGHT_DECAY,
             world_size=world_size,
+            save_every=int(args.save_every),
+            resume_from=resume_path,
         )
         with open(os.path.join(out_dir, "meta.json"), "w") as f:
             import json
@@ -651,38 +889,85 @@ def main() -> None:
         print(f"[run] out_dir={out_dir}")
         print(f"[run] world_size={world_size} total_steps={total_steps} tokens/step={tokens_per_step}")
 
-    global_step = 0
+    steps_per_rotation = num_layers * steps_per_layer
+    start_rotation = min(ROTATIONS, global_step // steps_per_rotation) if steps_per_rotation > 0 else 0
+    rem = global_step - (start_rotation * steps_per_rotation)
+    start_layer = min(num_layers, rem // steps_per_layer) if steps_per_layer > 0 else 0
+    start_step_in_layer = rem - (start_layer * steps_per_layer)
+
     t0 = time.time()
 
     try:
-        for rotation in range(ROTATIONS):
-            for layer_idx in range(num_layers):
+        for rotation in range(start_rotation, ROTATIONS):
+            hidden_cache, pos_ids = build_hidden_cache(
+                train_loader,
+                teacher,
+                total_micro_steps,
+                args.batch_size,
+                args.seq_len,
+                device,
+                cache_device,
+            )
+
+            # Resume: advance cache to the correct layer/step within this rotation.
+            if rotation == start_rotation and (start_layer > 0 or start_step_in_layer > 0):
+                for li in range(start_layer):
+                    for micro_idx in range(total_micro_steps):
+                        hidden_states = hidden_cache[micro_idx].to(device, non_blocking=True)
+                        _dec_in, _dec_out, new_hidden = run_teacher_layer(
+                            teacher_layers[li],
+                            teacher_decoders[li],
+                            hidden_states,
+                            pos_ids,
+                            layer_sig_params[li],
+                            rotary_emb,
+                        )
+                        hidden_cache[micro_idx] = new_hidden.detach().to(cache_device)
+
+                if start_step_in_layer > 0:
+                    li = start_layer
+                    for micro_idx in range(start_step_in_layer * GRAD_ACCUM_STEPS):
+                        hidden_states = hidden_cache[micro_idx].to(device, non_blocking=True)
+                        _dec_in, _dec_out, new_hidden = run_teacher_layer(
+                            teacher_layers[li],
+                            teacher_decoders[li],
+                            hidden_states,
+                            pos_ids,
+                            layer_sig_params[li],
+                            rotary_emb,
+                        )
+                        hidden_cache[micro_idx] = new_hidden.detach().to(cache_device)
+
+            layer_start = start_layer if rotation == start_rotation else 0
+            for layer_idx in range(layer_start, num_layers):
+                step_start = start_step_in_layer if (rotation == start_rotation and layer_idx == layer_start) else 0
                 set_trainable_for_layer_hf(student_raw, layer_idx, TARGET_TRAINABLE)
                 student_runner.set_layer(layer_idx)
                 student.train()
                 teacher.eval()
-                train_loader.reset()
-
-                t_attr, t_dec = resolve_hf_decoder_submodule(teacher_layers[layer_idx])
-                _ = t_attr
 
                 if master:
-                    print(f"[layer] rotation={rotation} layer={layer_idx} steps={int(args.steps_per_layer)}")
+                    print(f"[layer] rotation={rotation} layer={layer_idx} steps={steps_per_layer}")
 
-                for step_in_layer in range(int(args.steps_per_layer)):
+                for step_in_layer in range(step_start, steps_per_layer):
                     # Gradient accumulation loop.
                     opt.zero_grad(set_to_none=True)
                     loss_acc = 0.0
 
                     for micro in range(GRAD_ACCUM_STEPS):
-                        x, _ = train_loader.next_batch(device)
-                        decoder_input = capture_decoder_input(teacher, t_dec, x)
-                        with torch.no_grad():
-                            t_out = t_dec(decoder_input)
-                            if isinstance(t_out, tuple):
-                                t_out = t_out[0]
-                        s_out = student(decoder_input)
+                        micro_idx = step_in_layer * GRAD_ACCUM_STEPS + micro
+                        hidden_states = hidden_cache[micro_idx].to(device, non_blocking=True)
+                        dec_in, t_out, new_hidden = run_teacher_layer(
+                            teacher_layers[layer_idx],
+                            teacher_decoders[layer_idx],
+                            hidden_states,
+                            pos_ids,
+                            layer_sig_params[layer_idx],
+                            rotary_emb,
+                        )
+                        s_out = student(dec_in)
                         loss = decoder_loss(s_out, t_out)
+                        hidden_cache[micro_idx] = new_hidden.detach().to(cache_device)
 
                         (loss / GRAD_ACCUM_STEPS).backward()
                         loss_acc += float(loss.detach().item())
@@ -690,18 +975,41 @@ def main() -> None:
                     opt.step()
                     global_step += 1
 
-                    if master and (step_in_layer % LOG_EVERY == 0 or step_in_layer + 1 == int(args.steps_per_layer)):
+                    if args.save_every and args.save_every > 0 and (global_step % int(args.save_every) == 0):
+                        if master:
+                            ckpt = dict(
+                                run_id=run_id,
+                                hf_model_path=hf_path,
+                                hf_config=teacher.config.to_dict() if hasattr(teacher, "config") else {},
+                                global_step=global_step,
+                                rotation=rotation,
+                                layer_idx=layer_idx,
+                                target_trainable=TARGET_TRAINABLE,
+                                student=student_raw.state_dict(),
+                                optimizer=opt.state_dict(),
+                            )
+                            _save_checkpoint(
+                                ckpt,
+                                _student_ckpt_name(global_step),
+                                out_dir,
+                                memory_cache,
+                                args.memory_cache,
+                                kind="step",
+                            )
+
+                    if master and (step_in_layer % LOG_EVERY == 0 or step_in_layer + 1 == steps_per_layer):
                         elapsed = time.time() - t0
                         tok_s = (global_step * tokens_per_step) / max(1e-9, elapsed)
                         avg_loss = loss_acc / GRAD_ACCUM_STEPS
                         print(
                             f"[train] step={global_step}/{total_steps} "
-                            f"rot={rotation} layer={layer_idx} s={step_in_layer+1}/{int(args.steps_per_layer)} "
+                            f"rot={rotation} layer={layer_idx} s={step_in_layer+1}/{steps_per_layer} "
                             f"loss={avg_loss:.4f} tok/s={tok_s:.0f}"
                         )
 
                 # Optional validation at layer boundaries.
                 if VAL_EVERY_LAYER:
+                    t_dec = teacher_decoders[layer_idx]
                     student.eval()
                     teacher.eval()
                     val_loader.reset()
@@ -735,7 +1043,11 @@ def main() -> None:
                         student=student_raw.state_dict(),
                         optimizer=opt.state_dict(),
                     )
-                    torch.save(ckpt, os.path.join(out_dir, f"student_layer{layer_idx:03d}.pt"))
+                    name = f"student_layer{layer_idx:03d}.pt"
+                    _save_checkpoint(ckpt, name, out_dir, memory_cache, args.memory_cache, kind="layer")
+                    if args.memory_cache:
+                        intermediate_name = f"student_intermediate_layer{layer_idx:03d}.pt"
+                        _consolidate_to_intermediate(memory_cache, ckpt, intermediate_name)
 
         if master:
             ckpt = dict(
@@ -749,7 +1061,17 @@ def main() -> None:
                 student=student_raw.state_dict(),
                 optimizer=opt.state_dict(),
             )
-            torch.save(ckpt, os.path.join(out_dir, "student_final.pt"))
+            _save_checkpoint(
+                ckpt,
+                _student_ckpt_name(global_step),
+                out_dir,
+                memory_cache,
+                args.memory_cache,
+                force_disk=True,
+                kind="final",
+            )
+            if args.memory_cache:
+                _evict_intermediate(memory_cache)
 
     finally:
         _ddp_cleanup()
