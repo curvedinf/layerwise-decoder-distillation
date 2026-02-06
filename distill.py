@@ -62,8 +62,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 SEED = 1337
 
 # Data
-TRAIN_GLOB = "data/fineweb10B/fineweb_train_*.bin"
-VAL_GLOB = "data/fineweb10B/fineweb_val_*.bin"
+TRAIN_GLOB = "data/fineweb_edu/train_*.bin"
+VAL_GLOB = "data/fineweb_edu/val_*.bin"
 DATA_MAGIC = 20240520
 DATA_VERSION = 1
 
@@ -103,7 +103,19 @@ ZERO_INIT_OUT_PROJ = True
 LOGIT_CAP = 30.0  # set <=0 to disable
 
 STUDENT_DECODER_KIND = "prototype"
-STUDENT_DECODER_KWARGS = dict(hidden_mult=4, activation="relu2", gated=False, zero_init_out=ZERO_INIT_OUT_PROJ)
+#
+# By default, the student decoder is made ~50% smaller than the teacher's decoder by inferring
+# the teacher's per-layer intermediate width and scaling it.
+STUDENT_DECODER_WIDTH_SCALE = 0.5  # set to 1.0 for parity; set to None to disable inference
+STUDENT_DECODER_KWARGS = dict(
+    # If `hidden_dim` is not provided, and `STUDENT_DECODER_WIDTH_SCALE` is not None,
+    # `swap_hf_decoders()` will set `hidden_dim = round_down_8(int(teacher_hidden_dim * scale))`.
+    hidden_dim=None,
+    hidden_mult=4,
+    activation="relu2",
+    gated=False,
+    zero_init_out=ZERO_INIT_OUT_PROJ,
+)
 
 # Training
 DEVICE_BATCH_SIZE = 16
@@ -117,9 +129,8 @@ TARGET_TRAINABLE = "decoder"  # "decoder" | "attn" | "block"
 USE_COMPILE = True
 COMPILE_WITH_DDP = False
 
-# Distillation loss
-KD_TAU = 2.0
-KD_ALPHA = 1.0  # 1.0 = pure KD; <1.0 blends in CE
+# Distillation loss (decoder output matching)
+DECODER_LOSS = "mse"  # currently only "mse"
 
 # Optimizer
 LR = 3e-4
@@ -252,6 +263,7 @@ class DecoderPrototype(nn.Module):
         self,
         n_embd: int,
         *,
+        hidden_dim: int | None = None,
         hidden_mult: int = 4,
         activation: str = "relu2",
         gated: bool = False,
@@ -260,7 +272,10 @@ class DecoderPrototype(nn.Module):
         super().__init__()
         self.activation = str(activation)
         self.gated = bool(gated)
-        hidden = int(hidden_mult) * int(n_embd)
+        if hidden_dim is None:
+            hidden = int(hidden_mult) * int(n_embd)
+        else:
+            hidden = int(hidden_dim)
         if self.gated:
             self.fc = nn.Linear(int(n_embd), 2 * hidden, bias=False)
             self.proj = nn.Linear(hidden, int(n_embd), bias=False)
@@ -367,6 +382,24 @@ class HFDecoderAdapter(nn.Module):
         return self.inner(hidden_states)
 
 
+def round_down_8(x: int) -> int:
+    return max(8, (int(x) // 8) * 8)
+
+
+def infer_decoder_intermediate_dim(decoder: nn.Module) -> int:
+    # Heuristic: maximum out_features among Linear submodules.
+    # Works for common decoders (LLaMA-style MLP, GPT-2 MLP, NeoX MLP).
+    best = None
+    for m in decoder.modules():
+        if isinstance(m, nn.Linear):
+            of = int(m.out_features)
+            if best is None or of > best:
+                best = of
+    if best is None:
+        raise RuntimeError(f"Could not infer intermediate dim from decoder module: {type(decoder).__name__}")
+    return int(best)
+
+
 def swap_hf_decoders(hf_model: nn.Module, *, decoder_kind: str, decoder_kwargs: dict) -> None:
     layers = resolve_hf_layers(hf_model)
     hidden_size = getattr(hf_model.config, "hidden_size", None)
@@ -377,8 +410,39 @@ def swap_hf_decoders(hf_model: nn.Module, *, decoder_kind: str, decoder_kwargs: 
 
     for layer in layers:
         attr, _old = resolve_hf_decoder_submodule(layer)
-        new = build_decoder(decoder_kind, int(hidden_size), dict(decoder_kwargs))
+        new_kwargs = dict(decoder_kwargs)
+        if decoder_kind == "prototype":
+            scale = STUDENT_DECODER_WIDTH_SCALE
+            if new_kwargs.get("hidden_dim") in (None, 0) and scale is not None:
+                old_inter = infer_decoder_intermediate_dim(_old)
+                new_kwargs["hidden_dim"] = round_down_8(int(old_inter * float(scale)))
+        new = build_decoder(decoder_kind, int(hidden_size), new_kwargs)
         setattr(layer, attr, HFDecoderAdapter(new))
+
+
+class StudentDecoderRunner(nn.Module):
+    """
+    Lightweight wrapper that exposes just the target layer's decoder forward.
+    Used so DDP can synchronize gradients while avoiding full-model forward passes.
+    """
+
+    def __init__(self, hf_model: nn.Module) -> None:
+        super().__init__()
+        self.hf_model = hf_model
+        self.layers = resolve_hf_layers(hf_model)
+        self.decoder_attrs = [resolve_hf_decoder_submodule(layer)[0] for layer in self.layers]
+        self.layer_idx = 0
+
+    def set_layer(self, layer_idx: int) -> None:
+        self.layer_idx = int(layer_idx)
+
+    def forward(self, decoder_input: torch.Tensor) -> torch.Tensor:
+        attr = self.decoder_attrs[self.layer_idx]
+        decoder = getattr(self.layers[self.layer_idx], attr)
+        out = decoder(decoder_input)
+        if isinstance(out, tuple):
+            out = out[0]
+        return out
 
 
 def set_trainable_for_layer_hf(hf_model: nn.Module, layer_idx: int, target: str) -> None:
@@ -409,18 +473,40 @@ def set_trainable_for_layer_hf(hf_model: nn.Module, layer_idx: int, target: str)
     for p in params:
         p.requires_grad = True
 
-def kd_loss(student_logits: torch.Tensor, teacher_logits: torch.Tensor, tau: float) -> torch.Tensor:
-    # Compute KL(p_t || p_s) over the vocab dimension, average over (B,T).
-    s = (student_logits.float() / tau)
-    t = (teacher_logits.float() / tau)
-    log_p_s = F.log_softmax(s, dim=-1)
-    p_t = F.softmax(t, dim=-1)
-    kl_tok = F.kl_div(log_p_s, p_t, reduction="none").sum(dim=-1)  # (B,T)
-    return (tau * tau) * kl_tok.mean()
+class _StopForward(Exception):
+    pass
 
 
-def ce_loss(student_logits: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    return F.cross_entropy(student_logits.float().view(-1, student_logits.size(-1)), y.view(-1))
+@torch.no_grad()
+def capture_decoder_input(hf_model: nn.Module, decoder: nn.Module, input_ids: torch.Tensor) -> torch.Tensor:
+    """
+    Run the HF model forward until the target decoder is about to execute.
+    Cache and return the decoder input (latent) without running the decoder or later layers.
+    """
+    captured: dict[str, torch.Tensor] = {}
+
+    def _pre_hook(_module: nn.Module, inputs: tuple[torch.Tensor, ...]) -> None:
+        if "x" not in captured:
+            captured["x"] = inputs[0].detach()
+        raise _StopForward()
+
+    handle = decoder.register_forward_pre_hook(_pre_hook)
+    try:
+        hf_model(input_ids=input_ids, use_cache=False)
+    except _StopForward:
+        pass
+    finally:
+        handle.remove()
+
+    if "x" not in captured:
+        raise RuntimeError("Failed to capture decoder input: decoder was not invoked.")
+    return captured["x"]
+
+
+def decoder_loss(student_out: torch.Tensor, teacher_out: torch.Tensor) -> torch.Tensor:
+    if DECODER_LOSS == "mse":
+        return F.mse_loss(student_out.float(), teacher_out.float())
+    raise ValueError(f"Unknown DECODER_LOSS: {DECODER_LOSS}")
 
 
 def load_state_dict_strict(model: nn.Module, state_dict: dict) -> None:
@@ -487,7 +573,8 @@ def main() -> None:
     ).to(device)
     swap_hf_decoders(student_raw, decoder_kind=STUDENT_DECODER_KIND, decoder_kwargs=STUDENT_DECODER_KWARGS)
 
-    student: nn.Module = student_raw
+    student_runner = StudentDecoderRunner(student_raw)
+    student: nn.Module = student_runner
     if dist.is_initialized():
         # Layer-wise freezing can produce unused params in the backward graph.
         student = DDP(student, device_ids=[local_rank], find_unused_parameters=True)
@@ -524,7 +611,8 @@ def main() -> None:
     opt = _make_optimizer()
 
     tokens_per_step = DEVICE_BATCH_SIZE * SEQ_LEN * world_size * GRAD_ACCUM_STEPS
-    num_layers = len(resolve_hf_layers(student_raw))
+    teacher_layers = resolve_hf_layers(teacher)
+    num_layers = len(teacher_layers)
     total_steps = num_layers * int(args.steps_per_layer) * ROTATIONS
 
     if master:
@@ -549,8 +637,8 @@ def main() -> None:
             target_trainable=TARGET_TRAINABLE,
             student_decoder_kind=STUDENT_DECODER_KIND,
             student_decoder_kwargs=STUDENT_DECODER_KWARGS,
-            kd_tau=KD_TAU,
-            kd_alpha=KD_ALPHA,
+            student_decoder_width_scale=STUDENT_DECODER_WIDTH_SCALE,
+            decoder_loss=DECODER_LOSS,
             lr=LR,
             weight_decay=WEIGHT_DECAY,
             world_size=world_size,
@@ -570,7 +658,12 @@ def main() -> None:
         for rotation in range(ROTATIONS):
             for layer_idx in range(num_layers):
                 set_trainable_for_layer_hf(student_raw, layer_idx, TARGET_TRAINABLE)
+                student_runner.set_layer(layer_idx)
                 student.train()
+                teacher.eval()
+
+                t_attr, t_dec = resolve_hf_decoder_submodule(teacher_layers[layer_idx])
+                _ = t_attr
 
                 if master:
                     print(f"[layer] rotation={rotation} layer={layer_idx} steps={int(args.steps_per_layer)}")
@@ -581,16 +674,14 @@ def main() -> None:
                     loss_acc = 0.0
 
                     for micro in range(GRAD_ACCUM_STEPS):
-                        x, y = train_loader.next_batch(device)
+                        x, _ = train_loader.next_batch(device)
+                        decoder_input = capture_decoder_input(teacher, t_dec, x)
                         with torch.no_grad():
-                            teacher_logits = teacher(input_ids=x).logits
-                        student_logits = student(input_ids=x).logits
-
-                        loss_kd = kd_loss(student_logits, teacher_logits, KD_TAU)
-                        if KD_ALPHA < 1.0:
-                            loss = KD_ALPHA * loss_kd + (1.0 - KD_ALPHA) * ce_loss(student_logits, y)
-                        else:
-                            loss = loss_kd
+                            t_out = t_dec(decoder_input)
+                            if isinstance(t_out, tuple):
+                                t_out = t_out[0]
+                        s_out = student(decoder_input)
+                        loss = decoder_loss(s_out, t_out)
 
                         (loss / GRAD_ACCUM_STEPS).backward()
                         loss_acc += float(loss.detach().item())
@@ -617,15 +708,18 @@ def main() -> None:
                     with torch.no_grad():
                         for _ in range(val_steps):
                             x_val, _ = val_loader.next_batch(device)
-                            tlog = teacher(input_ids=x_val).logits
-                            slog = student(input_ids=x_val).logits
-                            val_loss += kd_loss(slog, tlog, KD_TAU)
+                            dec_in = capture_decoder_input(teacher, t_dec, x_val)
+                            t_out = t_dec(dec_in)
+                            if isinstance(t_out, tuple):
+                                t_out = t_out[0]
+                            s_out = student(dec_in)
+                            val_loss += decoder_loss(s_out, t_out)
                     val_loss = val_loss / float(val_steps)
                     if dist.is_initialized():
                         dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
                         val_loss = val_loss / float(world_size)
                     if master:
-                        print(f"[val] rotation={rotation} layer={layer_idx} kd_loss={float(val_loss.item()):.4f}")
+                        print(f"[val] rotation={rotation} layer={layer_idx} decoder_loss={float(val_loss.item()):.4f}")
 
                 # Save intermediate checkpoint (per layer).
                 if master:
