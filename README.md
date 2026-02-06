@@ -1,6 +1,8 @@
 # layerwise-decoder-distillation
 
-Train and distill decoder-only language models using a simple token-shard format and a layer-wise rotation schedule.
+Layer-wise decoder distillation for Hugging Face decoder-only language models. Includes a token-shard data pipeline, teacher/student decoder swapping, and a rotation schedule with per-layer checkpoints.
+
+Distillation works by capturing the teacher’s decoder-input latent at a chosen layer, running both teacher and student decoders on that same latent, and updating only the student decoder to match the teacher output while the rest of the model stays aligned to the teacher; this repeats layer-by-layer for a fixed number of steps with optional validation, and checkpoints keep the teacher backbone but replace all decoders with the distilled student versions.
 
 ## Quickstart (AMD/ROCm)
 

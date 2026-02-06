@@ -661,6 +661,7 @@ def main() -> None:
                 student_runner.set_layer(layer_idx)
                 student.train()
                 teacher.eval()
+                train_loader.reset()
 
                 t_attr, t_dec = resolve_hf_decoder_submodule(teacher_layers[layer_idx])
                 _ = t_attr
