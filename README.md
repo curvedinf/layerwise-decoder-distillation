@@ -1,4 +1,4 @@
-# llm-decoder-distillation
+# layerwise-decoder-distillation
 
 Train and distill decoder-only language models using a simple token-shard format and a layer-wise rotation schedule.
 

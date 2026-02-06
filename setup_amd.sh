@@ -13,7 +13,6 @@ set -euo pipefail
 #   ./setup_amd.sh --rocm-arch gfx942
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV_DIR="$SCRIPT_DIR/.venv"
 PYTHON_BIN="${PYTHON:-python3}"
 
 ROCM_ARCH=""
@@ -50,6 +49,15 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Prefer the currently active venv if one is activated. Otherwise use repo-local .venv.
+if [[ -n "${VIRTUAL_ENV:-}" && -x "${VIRTUAL_ENV}/bin/python" ]]; then
+  VENV_DIR="${VIRTUAL_ENV}"
+  echo "Using active venv: ${VENV_DIR}"
+else
+  VENV_DIR="$SCRIPT_DIR/.venv"
+  echo "Using repo venv: ${VENV_DIR}"
+fi
+
 if [[ -n "${ROCM_ARCH:-}" ]]; then
   if [[ ! "$ROCM_ARCH" =~ ^gfx[0-9a-z]+$ ]]; then
     echo "Invalid ROCm arch: '$ROCM_ARCH' (expected e.g. gfx1100, gfx942)" >&2
@@ -63,6 +71,11 @@ else
 fi
 
 if [[ ! -x "$VENV_DIR/bin/python" ]]; then
+  # Only create a venv if we are using the repo venv path (i.e. no active venv).
+  if [[ "$VENV_DIR" != "$SCRIPT_DIR/.venv" ]]; then
+    echo "Active venv selected but ${VENV_DIR}/bin/python is missing or not executable." >&2
+    exit 1
+  fi
   echo "Creating venv at $VENV_DIR using $PYTHON_BIN..."
   if ! "$PYTHON_BIN" -m venv "$VENV_DIR"; then
     echo "Failed to create venv. Install the python venv package for your Python version." >&2
@@ -71,13 +84,13 @@ if [[ ! -x "$VENV_DIR/bin/python" ]]; then
   fi
 fi
 
-source "$VENV_DIR/bin/activate"
+VENV_PY="$VENV_DIR/bin/python"
 
-python -m pip install --upgrade pip wheel
+"$VENV_PY" -m pip install --upgrade pip wheel
 
 # NOTE: This intentionally installs only the minimal deps required to run training code.
 # Optional performance kernels (xformers/flash-attn/etc.) are not installed here.
-python -m pip install --upgrade \
+"$VENV_PY" -m pip install --upgrade \
   --index-url https://download.pytorch.org/whl/rocm6.4 \
   torch==2.8.0 \
   torchvision \
@@ -85,11 +98,11 @@ python -m pip install --upgrade \
   pytorch-triton-rocm==3.4.0 \
   triton==3.4.0
 
-python -m pip install --upgrade --index-url https://pypi.org/simple \
+"$VENV_PY" -m pip install --upgrade --index-url https://pypi.org/simple \
   numpy \
   tqdm
 
-python - <<'PY'
+"$VENV_PY" - <<'PY'
 import importlib.metadata as md
 
 for name in ("torch", "triton", "pytorch-triton-rocm", "numpy", "tqdm"):
